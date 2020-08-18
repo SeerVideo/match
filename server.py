@@ -2,6 +2,9 @@ from elasticsearch import Elasticsearch
 from flask import Flask, request
 from image_match.elasticsearch_driver import SignatureES
 from image_match.goldberg import ImageSignature
+from minio import Minio
+from minio.error import ResponseError
+import uuid
 import json
 import os
 import sys
@@ -13,11 +16,18 @@ es_url = os.environ['ELASTICSEARCH_URL']
 es_index = os.environ['ELASTICSEARCH_INDEX']
 es_doc_type = os.environ['ELASTICSEARCH_DOC_TYPE']
 all_orientations = os.environ['ALL_ORIENTATIONS']
+access_key = os.environ['S3_ACCESS_KEY_ID']
+secret_key = os.environ['S3_SECRET_ACCESS_KEY']
 
 app = Flask(__name__)
 es = Elasticsearch([es_url], verify_certs=True, timeout=60, max_retries=10, retry_on_timeout=True)
 ses = SignatureES(es, index=es_index, doc_type=es_doc_type)
 gis = ImageSignature()
+client = Minio(
+    'storage.seer.seercloud.net',
+    access_key=os.environ.get('S3_ACCESS_KEY_ID'),
+    secret_key=os.environ.get('S3_SECRET_ACCESS_KEY'),
+    secure=True)
 
 # Try to create the index and ignore IndexAlreadyExistsException
 # if the index already exists
@@ -26,11 +36,68 @@ es.indices.create(index=es_index, ignore=400)
 # =============================================================================
 # Helpers
 
+def next_available_identity():
+    res = es.indices.get(index='identity')
+
+    match_all = {
+        'size': 100,
+        'query': {
+            'match_all': {}
+        }
+    }
+
+    resp = es.search(
+        index='identity',
+        body=match_all,
+        scroll = '2s')
+
+    old_scroll_id = resp['_scroll_id']
+    id_strings = []
+
+    while len(resp['hits']['hits']):
+
+        resp = es.scroll(
+            scroll_id = old_scroll_id,
+            scroll = '2s'
+        )
+
+        old_scroll_id = resp['_scroll_id']
+
+        for doc in resp['hits']['hits']:
+            id_int = int(doc['_source']['id_string'][1:])
+            id_strings.append(id_int)
+
+    id_strings = sorted(id_strings)
+    prev = id_strings[0]
+    for i in range(1, len(id_strings)):
+        current = id_strings[i]
+        if current - prev > 1:
+            new_id_string = 'n'+''.join(['0' for _ in range(6-len(str(prev+1)))])
+            new_id_string += str(prev+1)
+            return new_id_string
+        prev = current
+
+    new_id_string = 'n'+''.join(['0' for _ in range(6-len(str(prev+1)))])
+    new_id_string += str(prev+1)
+    return new_id_string
+
+
+def format_identity_name(string):
+    if ' ' in string:
+        string = string.rstrip()
+        string = string.lstrip()
+    string = string.split(' ')
+    string = [s.capitalize() for s in string]
+    string = '_'.join(string)
+    return string
+
+
 def ids_with_path(path):
     matches = es.search(index=es_index,
                         _source='_id',
                         q='path:' + json.dumps(path))
     return [m['_id'] for m in matches['hits']['hits']]
+
 
 def paths_at_location(offset, limit):
     search = es.search(index=es_index,
@@ -39,15 +106,19 @@ def paths_at_location(offset, limit):
                        _source='path')
     return [h['_source']['path'] for h in search['hits']['hits']]
 
+
 def count_images():
     return es.count(index=es_index)['count']
+
 
 def delete_ids(ids):
     for i in ids:
         es.delete(index=es_index, doc_type=es_doc_type, id=i, ignore=404)
 
+
 def dist_to_percent(dist):
-    return (1 - dist) * 100
+    return (1.0 - dist) * 100
+
 
 def get_image(url_field, file_field):
     if url_field in request.form:
@@ -55,9 +126,9 @@ def get_image(url_field, file_field):
     else:
         return request.files[file_field].read(), True
 
+
 # =============================================================================
 # Routes
-
 @app.route('/add', methods=['POST'])
 def add_handler():
     path = request.form['filepath']
@@ -78,6 +149,7 @@ def add_handler():
         'result': []
     })
 
+
 @app.route('/delete', methods=['DELETE'])
 def delete_handler():
     path = request.form['filepath']
@@ -89,6 +161,62 @@ def delete_handler():
         'method': 'delete',
         'result': []
     })
+
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if request.method == 'POST':
+        id_string = request.form['id_string']
+        _uuid = str(uuid.uuid4().int)[:19]
+        return json.dumps({
+            'status': 'ok',
+            'error': [],
+            'method': 'upload',
+            'result': _uuid
+        })
+        #client.fput_object(bucket, )
+
+
+@app.route('/identity', methods=['GET', 'POST'])
+def identity_handler():
+    if request.method == 'GET':
+        query_string = request.form['name']
+        body = {}
+        body['query'] = {}
+        body['query']['fuzzy'] = {'name': query_string}
+        res = es.search(index='identity', body=body)
+
+        matched = []
+        for x in res['hits']['hits']:
+            matched.append(x['_source'])
+
+        return json.dumps({
+            'status': 'ok',
+            'error': [],
+            'method': 'identity',
+            'result': matched
+        })
+
+    elif request.method == 'POST':
+        id_string = next_available_identity()
+        name = request.form['name']
+        name = format_identity_string(name)
+
+        body = {}
+        body["id_string"] = id_string
+        body["name"] = name
+        es.index(
+            index='identity',
+            doc_type='person',
+            body=body)
+        
+        return json.dumps({
+            'status': 'ok',
+            'error': [],
+            'method': 'identity',
+            'result': body
+        })
+
 
 @app.route('/search', methods=['POST'])
 def search_handler():
@@ -111,6 +239,7 @@ def search_handler():
         } for m in matches]
     })
 
+
 @app.route('/compare', methods=['POST'])
 def compare_handler():
     img1, bs1 = get_image('url1', 'image1')
@@ -126,6 +255,7 @@ def compare_handler():
         'result': [{ 'score': score }]
     })
 
+
 @app.route('/count', methods=['GET', 'POST'])
 def count_handler():
     count = count_images()
@@ -135,6 +265,7 @@ def count_handler():
         'method': 'count',
         'result': [count]
     })
+
 
 @app.route('/list', methods=['GET', 'POST'])
 def list_handler():
@@ -152,6 +283,7 @@ def list_handler():
         'method': 'list',
         'result': paths
     })
+
 
 @app.route('/ping', methods=['GET', 'POST'])
 def ping_handler():
@@ -174,6 +306,7 @@ def bad_request(e):
         'result': []
     }), 400
 
+
 @app.errorhandler(404)
 def page_not_found(e):
     return json.dumps({
@@ -183,6 +316,7 @@ def page_not_found(e):
         'result': []
     }), 404
 
+
 @app.errorhandler(405)
 def method_not_allowed(e):
     return json.dumps({
@@ -191,6 +325,7 @@ def method_not_allowed(e):
         'method': '',
         'result': []
     }), 405
+
 
 @app.errorhandler(500)
 def server_error(e):

@@ -1,13 +1,29 @@
 version: '2'
 services:
   match:
-    image: dsys/match:latest
+    image: seth_match
+    build: .
     ports:
     - 8888:8888
     command: ["/wait-for-it.sh", "-t", "60", "elasticsearch:9200", "--", "gunicorn", "-b", "0.0.0.0:8888", "-w", "4", "server:app"]
     links:
     - elasticsearch
+    volumes:
+    - ./server.py:/server.py:ro
+    - ./wait-for-it.sh:/wait-for-it.sh:ro
+    environment:
+    - S3_ACCESS_KEY_ID=cTmGC2knjDhQQvJ9r38
+    - S3_SECRET_ACCESS_KEY=VxCya7GZ3q67nyZxHePgaekttDaZBP
+    - PORT=80
+    - WORKER_COUNT=4
+    - ELASTICSEARCH_URL=elasticsearch:9200
+    - ELASTICSEARCH_INDEX=images
+    - ELASTICSEARCH_DOC_TYPE=images
+    - ALL_ORIENTATIONS=true
   elasticsearch:
     image: elasticsearch:6.4.2
     ports:
     - 9200:9200
+    volumes:
+    - ./elasticdata:/usr/share/elasticsearch/data
+
